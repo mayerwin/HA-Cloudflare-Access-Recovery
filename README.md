@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-If your Home Assistant frontend silently freezes after a few hours or days behind Cloudflare Tunnel + Cloudflare Access (UI stops updating, entities go stale, automations still fire on the server), you're hitting an expired `CF_Authorization` cookie. HA can't self-recover because of a three-way trap: CORS hides the auth redirect, WebSockets can't read an HTML login page, and the Service Worker keeps serving the cached UI shell so the tab never hits the network.
+If your Home Assistant frontend silently freezes after a few days or weeks behind Cloudflare Tunnel + Cloudflare Access (error message "Unable to connect to Home Assistant", while automations still fire on the server), you're hitting an expired `CF_Authorization` cookie. HA can't self-recover because of a three-way trap: CORS hides the auth redirect, WebSockets can't read an HTML login page, and the Service Worker keeps serving the cached UI shell so the tab never hits the network.
 
 **Fix it in three steps:**
 
