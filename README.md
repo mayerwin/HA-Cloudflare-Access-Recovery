@@ -19,7 +19,7 @@ If your Home Assistant frontend silently freezes after a few days or weeks behin
    ```
 3. Restart HA, then do one "Empty Cache and Hard Reload" in each browser you use.
 
-From then on, any stuck HA tab self-heals within 60 seconds — a cache-busting probe detects the Cloudflare wall, unregisters the Service Worker, and reloads the tab. Because your Cloudflare Access SSO session cookie usually outlives the per-app `CF_Authorization`, you typically don't even see a login prompt — just a brief flash back to your dashboard.
+From then on, any stuck HA tab self-heals — usually within a few seconds, at worst within 60. Two independent detection paths run in parallel: an **event-driven hook** on HA's own WebSocket lifecycle that catches mid-session failures almost instantly, and a **60-second polling probe** as a safety net for cold-starts and edge cases where the WebSocket itself doesn't die. Both paths trigger the same cache-busting probe that detects the Cloudflare wall, unregisters the Service Worker, and reloads the tab. Because your Cloudflare Access SSO session cookie usually outlives the per-app `CF_Authorization`, you typically don't even see a login prompt — just a brief flash back to your dashboard.
 
 Read on for the full story, the failure modes, and how to verify it's working.
 
@@ -70,7 +70,7 @@ So the page looks alive but is completely deaf to the auth layer. Hitting refres
 
 ## The fix, in detail
 
-`cloudflare_recovery.js` is a small watcher that runs inside the HA frontend. Every 60 seconds it:
+`cloudflare_recovery.js` is a small watcher that runs inside the HA frontend. The core probe — the only place that touches the network or decides to recover — does this:
 
 1. Fires a `fetch()` at the current path with a cache-busting query string (`?_cb=<timestamp>`) plus `Cache-Control: no-cache` headers, forcing the Service Worker to actually hit the network instead of replaying its cached shell.
 2. Uses `redirect: 'manual'` — this is the trick that makes the Cloudflare 302 observable as `response.type === 'opaqueredirect'` instead of being swallowed by CORS.
@@ -78,6 +78,40 @@ So the page looks alive but is completely deaf to the auth layer. Hitting refres
 4. On detection: unregisters every Service Worker, then calls `window.location.reload()`. With the SW gone, the browser hits the network natively, Cloudflare returns its real 302, and the tab lands on the Cloudflare Access login page. Because your Cloudflare Access SSO session cookie is almost always still valid, you're bounced straight back to HA without typing anything.
 
 If the device is simply offline, the `fetch` throws a `TypeError` that the script silently ignores — no gratuitous reloads when your Wi-Fi blips.
+
+---
+
+## Detection methods (and why there are two)
+
+The probe above is fired by two independent triggers, each addressing a failure mode the other can't:
+
+### Method 1 — Periodic polling (60 s default)
+A `setInterval` runs the probe every `POLLING_INTERVAL_MS`. This is the original, simple approach. It catches **everything** eventually, including the worst case: a fresh tab opened with an expired CF cookie where HA gets stuck on the "Loading data" splash and `hass.connection` never even exists. It's also the only path that can fire when no specific event tells us anything is wrong (e.g. WebSocket alive but other requests being blocked).
+
+The trade-off: up to a full minute of stuck-tab time before recovery starts.
+
+### Method 2 — WebSocket event hook (event-driven, near-instant)
+Subscribes to HA's own `home-assistant-js-websocket` Connection object — specifically the `disconnected` and `reconnect-error` events — and runs the probe within `WS_FAIL_DEBOUNCE_MS` (3 s default) of any failure. When the live WebSocket dies because Cloudflare started rejecting its handshake, the hook fires almost immediately, debounces a flurry of reconnect retries into a single probe, and recovery kicks in.
+
+A natural question: *why not just subclass `window.WebSocket`?* That was the first attempt — but `home-assistant-js-websocket` captures a reference to the original `WebSocket` constructor at its own module-load time, which is before `extra_module_url` scripts execute. Any monkey-patch lands too late to intercept the connection. Subscribing to the higher-level Connection events is the only intercept point that works.
+
+The hook has one limitation: it can only attach once `hass.connection` exists, which is *after* HA's frontend has bootstrapped. So it can't catch the cold-start "stuck on Loading data" case — that's what polling is for. The two methods are complementary, not redundant.
+
+### Configuration
+
+The top of `cloudflare_recovery.js` exposes both as flags:
+
+```js
+const ENABLE_POLLING = true;         // Periodic probe every POLLING_INTERVAL_MS.
+const ENABLE_WEBSOCKET_HOOK = true;  // Probe only when HA's WebSocket fails.
+const POLLING_INTERVAL_MS = 60000;
+const WS_FAIL_DEBOUNCE_MS = 3000;    // Coalesce a flurry of reconnect failures into one probe.
+const DEBUG = false;                 // Verbose console logging for testing.
+```
+
+Both methods enabled is the recommended default — they cover non-overlapping cases and the cost of running both is negligible. Disable polling if you're willing to trade cold-start coverage for zero idle traffic, or disable the hook if you want a maximally simple installation.
+
+Setting `DEBUG = true` makes every step log to the console (probe runs, hook attachments, debounce decisions) — useful when validating the install, noisy in normal use.
 
 ---
 
@@ -128,13 +162,35 @@ Three things worth verifying. The steps below use Chromium DevTools (Chrome, Edg
    ```js
    typeof checkCloudflareWall
    ```
-   It should return `"function"`. If it returns `"undefined"`, the module isn't being loaded — double-check the `extra_module_url:` entry and clear the cache again.
+   It should return `"function"`. If it returns `"undefined"`, the module isn't being loaded — double-check the `extra_module_url:` entry and clear the cache again. (Note: `extra_module_url` loads files as ES modules, which scope top-level declarations to the module — but `checkCloudflareWall` is deliberately re-exposed on `window` for exactly this test.)
 
-### Test 2 — It's actually polling
+### Test 2a — Polling is firing
 
 1. In **DevTools → Network**, filter by `_cb=`.
 2. Wait up to 60 seconds. You should see a new request every minute to your current path with a `?_cb=<timestamp>` query string.
 3. While the session is valid, those requests return `200 OK` with the HA shell — and nothing else happens. That's the correct "quiet" behavior.
+
+### Test 2b — The WebSocket hook is attached
+
+Flip `DEBUG = true` at the top of the script (and restart HA to pick up the change). On the next page load, the Console should show:
+
+```
+[cloudflare_recovery] polling enabled, interval 60000 ms
+[cloudflare_recovery] WebSocket hook enabled, debounce 3000 ms
+[cloudflare_recovery] probe running, reason: page-load
+[cloudflare_recovery] probe result: { ..., isCloudflareWall: false }
+[cloudflare_recovery] attached to HA connection
+```
+
+That last line is the proof the hook found `hass.connection` and registered its listeners. You can also force a hook event manually from the console:
+
+```js
+document.querySelector('home-assistant').hass.connection.fireEvent('reconnect-error', new Error('test'));
+```
+
+You should immediately see `[cloudflare_recovery] HA connection: reconnect-error` followed by `probe scheduled` and `probe running`. The probe will return `isCloudflareWall: false` (because there's no actual wall) — that's the disambiguation working as designed.
+
+Flip `DEBUG = false` again before normal use.
 
 ### Test 3 — Force a Cloudflare expiry and watch the self-heal
 
@@ -170,7 +226,7 @@ This is the important one. You want to simulate the exact condition that trapped
 
 - The script only ever fetches its own origin (`window.location.pathname`). It never exposes cookies or tokens to a third party.
 - Unregistering Service Workers is a local, reversible operation — HA will re-register its SW on the next successful load.
-- The 60-second interval is conservative. If your Cloudflare Access session policy is short (say, 15 minutes) and you care about minimizing the visible gap, you can drop it to `15000` (15 seconds). Much lower than that and you're making unnecessary network calls.
+- The 60-second polling interval is conservative. With the event-driven WebSocket hook enabled (the default), mid-session expiry recovery already fires within seconds, so dropping the interval gives diminishing returns — but if you only want polling and a short session policy, `15000` (15 s) is reasonable. Much lower than that and you're making unnecessary network calls.
 
 ---
 
