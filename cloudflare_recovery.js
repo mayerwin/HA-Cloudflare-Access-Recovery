@@ -38,17 +38,91 @@
 //      window.location.reload(). With the SW gone, the browser hits the
 //      network natively, Cloudflare returns its real 302, and you land on the
 //      Cloudflare Access login page. After login, you're back in HA.
+//
+// Second failure mode (added later) — WebSocket UPGRADE header stripped:
+//   When the HTTP probe returns a clean 200 but the live WebSocket keeps
+//   dying anyway, the upgrade itself is being mangled somewhere between the
+//   browser and HA — usually because cloudflared is running on its default
+//   QUIC transport (--protocol=auto) and the `Upgrade: websocket` header
+//   doesn't survive the QUIC↔HTTP/1.1 translation. The origin sees a plain
+//   GET and HA's aiohttp replies "No WebSocket UPGRADE hdr: None", 400.
+//   The browser surfaces this as code 1006 with no `open` event.
+//
+//   probeWebSocketHandshake() detects exactly this signature. The fix lives
+//   in cloudflared, not the browser, so the script does NOT reload — it logs
+//   loudly to the console with a pointer to the README, throttled to one
+//   message every 5 minutes so a reconnect loop doesn't spam.
 // -----------------------------------------------------------------------------
 
 // === Detection methods — enable either, both, or neither ===
-const ENABLE_POLLING = true;         // Periodic probe every POLLING_INTERVAL_MS.
-const ENABLE_WEBSOCKET_HOOK = true;  // Probe only when HA's WebSocket fails.
+const ENABLE_POLLING = true;             // Periodic probe every POLLING_INTERVAL_MS.
+const ENABLE_WEBSOCKET_HOOK = true;      // Probe only when HA's WebSocket fails.
+const ENABLE_WS_HANDSHAKE_PROBE = true;  // After a WS failure with a clean HTTP probe,
+                                         // attempt a fresh WebSocket and detect the
+                                         // "upgrade header stripped" failure mode
+                                         // (see README, "Second failure mode").
 const POLLING_INTERVAL_MS = 60000;
-const WS_FAIL_DEBOUNCE_MS = 3000;    // Coalesce a flurry of reconnect failures into one probe.
-const DEBUG = false;                 // Verbose console logging for testing.
+const WS_FAIL_DEBOUNCE_MS = 3000;        // Coalesce a flurry of reconnect failures into one probe.
+const WS_HANDSHAKE_TIMEOUT_MS = 1500;    // Max wait for the diagnostic WS to do anything.
+const WS_HANDSHAKE_STRIPPED_MS = 1000;   // Close-without-open under this is the stripped signature.
+const WS_STRIPPED_LOG_THROTTLE_MS = 5 * 60 * 1000; // At most one stripped-log every 5 min.
+const DEBUG = false;                     // Verbose console logging for testing.
 // ===========================================================
 
 const log = (...args) => DEBUG && console.log('[cloudflare_recovery]', ...args);
+
+// Reasons that came from HA's WebSocket lifecycle (vs polling / page-load).
+const isWsTriggeredReason = (reason) =>
+    reason === 'ha-disconnected' || reason === 'ha-reconnect-error';
+
+// Throttle the second-failure-mode error log so a reconnect loop doesn't spam.
+let lastStrippedLogAt = 0;
+
+// Open a fresh WebSocket and watch the handshake. The "upgrade stripped"
+// signature is: closes with code 1006, wasClean: false, no `open` event ever
+// fires, and the whole thing happens in under WS_HANDSHAKE_STRIPPED_MS.
+// This corresponds to the origin returning a non-101 HTTP response (typically
+// HA's aiohttp 400 'No WebSocket UPGRADE hdr: None') because the Upgrade
+// header didn't survive the tunnel — most commonly seen with cloudflared
+// using its default QUIC transport (--protocol=auto).
+async function probeWebSocketHandshake() {
+    return new Promise((resolve) => {
+        const started = Date.now();
+        let opened = false;
+        let ws;
+        try {
+            ws = new WebSocket('wss://' + location.host + '/api/websocket');
+        } catch (err) {
+            resolve({ stripped: false, reason: 'constructor-threw', error: String(err) });
+            return;
+        }
+        const timer = setTimeout(() => {
+            try { ws.close(); } catch (_) {}
+            resolve({ stripped: false, reason: 'timeout', elapsedMs: Date.now() - started });
+        }, WS_HANDSHAKE_TIMEOUT_MS);
+        ws.onopen = () => {
+            opened = true;
+            clearTimeout(timer);
+            try { ws.close(); } catch (_) {}
+            resolve({ stripped: false, reason: 'open', elapsedMs: Date.now() - started });
+        };
+        ws.onclose = (e) => {
+            clearTimeout(timer);
+            const elapsedMs = Date.now() - started;
+            const stripped =
+                !opened &&
+                e.code === 1006 &&
+                elapsedMs < WS_HANDSHAKE_STRIPPED_MS;
+            resolve({
+                stripped,
+                reason: 'closed',
+                code: e.code,
+                wasClean: e.wasClean,
+                elapsedMs
+            });
+        };
+    });
+}
 
 async function checkCloudflareWall(reason = 'manual') {
     log('probe running, reason:', reason);
@@ -108,6 +182,36 @@ async function checkCloudflareWall(reason = 'manual') {
             // Native reload now bypasses the (gone) SW, hits Cloudflare, and
             // gracefully drops the user onto the Cloudflare Access login page.
             window.location.reload();
+            return;
+        }
+
+        // No Cloudflare wall on HTTP — but if a WebSocket failure event is
+        // what brought us here, the upgrade itself may be broken (the
+        // "upgrade stripped" case, typically caused by cloudflared on QUIC
+        // dropping the `Upgrade: websocket` header before it reaches the
+        // origin). A reload won't fix that, but we want to surface it loudly
+        // in the console so the user isn't left staring at a silent dead tab.
+        if (ENABLE_WS_HANDSHAKE_PROBE && isWsTriggeredReason(reason)) {
+            const handshake = await probeWebSocketHandshake();
+            log('handshake probe result:', handshake);
+            if (handshake.stripped) {
+                const now = Date.now();
+                if (now - lastStrippedLogAt > WS_STRIPPED_LOG_THROTTLE_MS) {
+                    lastStrippedLogAt = now;
+                    console.error(
+                        '[cloudflare_recovery] WebSocket upgrade appears to be ' +
+                        'stripped between the browser and Home Assistant ' +
+                        '(closed code 1006 in ' + handshake.elapsedMs + ' ms, no ' +
+                        '`open` event). This is NOT the cookie-expiry case — ' +
+                        'reloading will not fix it. Most common cause: cloudflared ' +
+                        'on default --protocol=auto (QUIC). Fix: set ' +
+                        '`--protocol=http2` in the cloudflared add-on `run_parameters`. ' +
+                        'See https://github.com/mayerwin/HA-Cloudflare-Access-Recovery' +
+                        '#second-failure-mode-websocket-upgrade-stripping'
+                    );
+                }
+                return;
+            }
         }
     } catch (error) {
         // Real network errors (offline, sleeping device, etc.) throw a TypeError.
@@ -116,8 +220,11 @@ async function checkCloudflareWall(reason = 'manual') {
     }
 }
 
-// Expose for manual testing from the DevTools console: checkCloudflareWall('test').
+// Expose for manual testing from the DevTools console:
+//   checkCloudflareWall('test')          — run the full probe pipeline.
+//   probeWebSocketHandshake().then(...)  — just check the WS upgrade path.
 window.checkCloudflareWall = checkCloudflareWall;
+window.probeWebSocketHandshake = probeWebSocketHandshake;
 
 // One-shot probe on load — catches the cold-start case where the tab is opened
 // with an already-expired CF cookie, before HA even attempts its first WebSocket.
