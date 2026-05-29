@@ -180,6 +180,15 @@ After the restart, re-open HA in a fresh tab. The WebSocket should connect on th
 
 A reload of the tab will not fix the upgrade stripping — the next reconnect will go back through the same broken path and die the same way. Worse, an auto-reload loop with no way out would actively get in your way while you tried to read the console message and find this README. So the script's policy is: detect the signature, log it loudly (throttled to one message every five minutes so a reconnect loop doesn't spam), and stop. The fix is genuinely a one-line change to your `cloudflared` add-on config — the script's job is to make sure you find that one line.
 
+### When the probe runs (and why it has to look in two places)
+
+The handshake probe is gated to two trigger paths, because each one catches a case the other can't:
+
+1. **HA's own WebSocket lifecycle events (`disconnected`, `reconnect-error`).** Catches the mid-session case — HA bootstrapped fine, you used the dashboard for a while, and now the live socket has died. This path can't catch cold-start: if HA's *first* WebSocket attempt fails, `home-assistant-js-websocket` never assigns `hass.connection`, so there is no object to attach the listeners to.
+2. **The 60-second polling tick, when `hass.connection` is missing or `connected: false`.** Catches the cold-start "stuck on Loading data" case the lifecycle hook can't see, plus belt-and-braces on mid-session failures the hook might somehow miss. Costs one extra WebSocket attempt per minute when something is wrong, zero when HA is healthy (the probe is gated on the silently-broken check).
+
+If the probe fires from path 2, you'll see exactly the same `console.error` as from path 1 — the failure mode is identical, only the trigger is different.
+
 ### A useful manual test
 
 You can confirm the path yourself from the browser console without waiting for a real failure:

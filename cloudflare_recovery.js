@@ -42,16 +42,21 @@
 // Second failure mode (added later) — WebSocket UPGRADE header stripped:
 //   When the HTTP probe returns a clean 200 but the live WebSocket keeps
 //   dying anyway, the upgrade itself is being mangled somewhere between the
-//   browser and HA — usually because cloudflared is running on its default
-//   QUIC transport (--protocol=auto) and the `Upgrade: websocket` header
-//   doesn't survive the QUIC↔HTTP/1.1 translation. The origin sees a plain
-//   GET and HA's aiohttp replies "No WebSocket UPGRADE hdr: None", 400.
-//   The browser surfaces this as code 1006 with no `open` event.
+//   browser and HA — usually cloudflared (default QUIC transport drops the
+//   `Upgrade: websocket` header during QUIC↔HTTP/1.1 translation), but the
+//   same symptom has also been observed transiently on HTTP/2 transport,
+//   suggesting the bug isn't purely on the QUIC path. The origin sees a
+//   plain GET and HA's aiohttp replies "No WebSocket UPGRADE hdr: None",
+//   400. The browser surfaces this as code 1006 with no `open` event.
 //
-//   probeWebSocketHandshake() detects exactly this signature. The fix lives
-//   in cloudflared, not the browser, so the script does NOT reload — it logs
-//   loudly to the console with a pointer to the README, throttled to one
-//   message every 5 minutes so a reconnect loop doesn't spam.
+//   probeWebSocketHandshake() detects exactly this signature. It runs:
+//     - on every HA WebSocket failure event (catches mid-session failures);
+//     - on the polling tick when hass.connection is missing or disconnected
+//       (catches the cold-start "stuck on Loading data" case, where there
+//       is no Connection object for the WS hook to attach to).
+//   The fix lives outside the browser, so the script does NOT reload — it
+//   logs loudly to the console with a pointer to the README, throttled to
+//   one message every 5 minutes so a reconnect loop doesn't spam.
 // -----------------------------------------------------------------------------
 
 // === Detection methods — enable either, both, or neither ===
@@ -74,6 +79,42 @@ const log = (...args) => DEBUG && console.log('[cloudflare_recovery]', ...args);
 // Reasons that came from HA's WebSocket lifecycle (vs polling / page-load).
 const isWsTriggeredReason = (reason) =>
     reason === 'ha-disconnected' || reason === 'ha-reconnect-error';
+
+// "Silently broken" = the WebSocket-driven HA Connection that the rest of the
+// frontend depends on is either missing or disconnected. Two distinct cases:
+//   - hass.connection doesn't exist: HA bootstrapped enough to mount the
+//     <home-assistant> element but the first WebSocket never succeeded, so
+//     home-assistant-js-websocket never reached the point of assigning
+//     hass.connection. This is the cold-start "stuck on Loading data" trap —
+//     the user sees "Unable to connect to Home Assistant, retrying in N s".
+//     The WebSocket hook can't help here because it has nothing to attach to.
+//   - hass.connection exists but reports connected:false: HA bootstrapped
+//     once, then the live socket died and reconnects are failing. The hook
+//     would have caught this case too, but we double-check on polling for
+//     belt-and-braces.
+// Used to decide whether to run the handshake probe on a non-WS-triggered
+// poll, since the HTTP probe alone can't tell us the WS path is dead.
+function isHaWebSocketSilentlyBroken() {
+    const ha = document.querySelector('home-assistant');
+    if (!ha) return false; // Too early — even the frontend hasn't mounted yet.
+    const conn = ha.hass && ha.hass.connection;
+    if (!conn) return true;
+    if (conn.connected === false) return true;
+    return false;
+}
+
+// Decide whether to run the WebSocket handshake probe for this call to
+// checkCloudflareWall. The probe opens a real WebSocket, which is cheap
+// (~250–1000 ms when it works, faster when it fails) but not free, so we
+// gate it: always run for explicit WS failure events; for periodic polling,
+// only run when HA's own Connection looks stuck.
+function shouldProbeHandshake(reason) {
+    if (!ENABLE_WS_HANDSHAKE_PROBE) return false;
+    if (isWsTriggeredReason(reason)) return true;
+    // page-load fires before HA has had time to bootstrap; do not probe yet.
+    if (reason === 'page-load') return false;
+    return isHaWebSocketSilentlyBroken();
+}
 
 // Throttle the second-failure-mode error log so a reconnect loop doesn't spam.
 let lastStrippedLogAt = 0;
@@ -185,13 +226,20 @@ async function checkCloudflareWall(reason = 'manual') {
             return;
         }
 
-        // No Cloudflare wall on HTTP — but if a WebSocket failure event is
-        // what brought us here, the upgrade itself may be broken (the
-        // "upgrade stripped" case, typically caused by cloudflared on QUIC
-        // dropping the `Upgrade: websocket` header before it reaches the
-        // origin). A reload won't fix that, but we want to surface it loudly
-        // in the console so the user isn't left staring at a silent dead tab.
-        if (ENABLE_WS_HANDSHAKE_PROBE && isWsTriggeredReason(reason)) {
+        // No Cloudflare wall on HTTP — but the WebSocket itself may be broken
+        // (the "upgrade stripped" case, typically caused by something between
+        // the browser and the origin dropping the `Upgrade: websocket` header).
+        // A reload won't fix that, but we want to surface it loudly in the
+        // console so the user isn't left staring at a silent dead tab.
+        //
+        // We probe in two situations:
+        //   - WS-triggered: HA's own Connection just fired disconnected /
+        //     reconnect-error. Always probe.
+        //   - Cold-start / silently-stuck: the periodic poll fires and
+        //     hass.connection is missing or disconnected. The WS hook can't
+        //     fire in this case (no Connection to attach to), so polling is
+        //     the only path that catches it.
+        if (shouldProbeHandshake(reason)) {
             const handshake = await probeWebSocketHandshake();
             log('handshake probe result:', handshake);
             if (handshake.stripped) {
@@ -203,10 +251,14 @@ async function checkCloudflareWall(reason = 'manual') {
                         'stripped between the browser and Home Assistant ' +
                         '(closed code 1006 in ' + handshake.elapsedMs + ' ms, no ' +
                         '`open` event). This is NOT the cookie-expiry case — ' +
-                        'reloading will not fix it. Most common cause: cloudflared ' +
-                        'on default --protocol=auto (QUIC). Fix: set ' +
-                        '`--protocol=http2` in the cloudflared add-on `run_parameters`. ' +
-                        'See https://github.com/mayerwin/HA-Cloudflare-Access-Recovery' +
+                        'reloading will not fix it. First thing to try: set ' +
+                        '`--protocol=http2` in the cloudflared add-on ' +
+                        '`run_parameters` if you have not already (this is the ' +
+                        'most common cause). If you are already on HTTP/2 and ' +
+                        'still see this, the bug is likely in a layer above ' +
+                        'cloudflared and may be intermittent — check Cloudflare ' +
+                        'status and retry. See ' +
+                        'https://github.com/mayerwin/HA-Cloudflare-Access-Recovery' +
                         '#second-failure-mode-websocket-upgrade-stripping'
                     );
                 }
