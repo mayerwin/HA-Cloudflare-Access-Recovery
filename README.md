@@ -1,73 +1,116 @@
 # Self-Healing Cloudflare Access Auth for Home Assistant
+### + reference for two related Cloudflare-Tunnel-in-front-of-HA failure modes that look identical
 
-> ## ⚠ 2026-06-05 update — read this before the rest
->
-> If you came here because your Home Assistant frontend silently freezes behind a Cloudflare Tunnel ("Unable to connect to Home Assistant", reloads don't help, mobile app still works) — **the actual root cause is most likely different from what the rest of this guide describes**. After a long debugging session on a setup with exactly that symptom, we traced it to:
->
-> ### Cloudflare's mTLS + HTTP/3 + WebSocket combination is broken in Chromium browsers
->
-> Specifically, if **all of the following are true** for your setup, this guide's `cloudflare_recovery.js` will not help you and the fix lives elsewhere:
->
-> 1. You expose HA via Cloudflare Tunnel (with or without Cloudflare Access — even with Access fully disabled).
-> 2. The hostname has **mTLS enabled** at Cloudflare (commonly: SSL/TLS → Client Certificates, "Hosts" includes your HA hostname — typically set up so the HA mobile Companion app can present a client cert).
-> 3. **HTTP/3 is enabled at the Cloudflare zone level** (it is, by default).
-> 4. You're using a **Chromium-family browser** (Chrome, Edge, Brave, Arc, Opera) — fresh incognito reproduces it cleanly.
->
-> **Firefox is unaffected** because Firefox doesn't implement WebSocket-over-HTTP/3 (RFC 8441 Extended CONNECT); it falls back to HTTP/1.1 for the WS upgrade. **Existing browser sessions** with a warm HTTP/2 connection to your tunnel also appear unaffected (the bug only manifests on cold connections that negotiate HTTP/3 from the start).
->
-> ### What's happening at the protocol level
->
-> mTLS makes the Cloudflare edge send a TLS 1.3 `CertificateRequest` (message 13) during the handshake. Browsers without a client cert reply with an empty `Certificate` message — standard mTLS-optional behavior. This works perfectly over HTTP/1.1 and HTTP/2. Over HTTP/3 (QUIC), the combination of `CertificateRequest` + the WebSocket `Upgrade` (RFC 8441) breaks somewhere in CF's edge: HA's first WS server frame (`auth_required`) never reaches the browser correctly, and the browser closes the connection within ~300 ms during the auth phase. HA's logs show:
->
-> ```
-> Connected from <ip>
-> Connection closed by client: Received close message during auth phase
-> ```
->
-> ### How to recognise it
->
-> From any terminal with `curl`:
->
-> ```bash
-> # If this prints a "Request CERT" line, your hostname has mTLS enforced at CF:
-> echo | curl -sSv --max-time 5 -o /dev/null https://YOUR-HA-HOSTNAME/ 2>&1 | grep "Request CERT"
-> ```
->
-> Combine that with: HTTP/3 ON at the zone (`dash.cloudflare.com → your zone → Network → HTTP/3 (with QUIC)`) and fresh Chrome incognito unable to complete the HA login WebSocket → this is your bug.
->
-> ### The fix: split hostnames
->
-> Cloudflare provides no way to disable HTTP/3 per-hostname on the free tier (we tried — Transform Rules stripping `Alt-Svc` don't help because CF also auto-publishes HTTPS DNS records (RFC 9460) advertising HTTP/3, which browsers read at DNS resolution time before any HTTP response).
->
-> The clean workaround is to use **two hostnames** pointing at the same tunnel:
->
-> | Hostname | mTLS | Purpose |
-> |---|---|---|
-> | `mobile-ha.example.com` | **ON** | HA mobile Companion app only |
-> | `ha.example.com` | **OFF** | Web browser access |
->
-> Setup steps:
->
-> 1. **Identify your existing mTLS hostname** — Cloudflare dashboard → SSL/TLS → Client Certificates → "Hosts". Don't change this; the mobile app continues using it.
-> 2. **Add a second public hostname** to your cloudflared tunnel (Zero Trust → Networks → Tunnels → your tunnel → Configure → Public Hostnames → add, e.g. `ha.example.com` pointing at `http://homeassistant:8123`). This second hostname is **not** added to the mTLS hosts list, so it has no `CertificateRequest` in its TLS handshake.
-> 3. **Verify the new hostname has no mTLS:**
->    ```bash
->    echo | curl -sSv --max-time 5 -o /dev/null https://ha.example.com/ 2>&1 | grep "Request CERT" || echo "no mTLS — good"
->    ```
-> 4. **Bookmark the new hostname** for browser use. Optionally set it as HA's External URL (Settings → System → General → External URL) so notifications, Google Assistant callbacks, etc. use it.
-> 5. **HA Companion mobile app stays on the mTLS hostname** — no change needed in the mobile app config.
->
-> HTTP/3 stays on zone-wide. Other subdomains keep HTTP/3. No performance regression anywhere.
->
-> ### What we ruled out before finding mTLS as the trigger
->
-> All of these were tested and innocent: HA SSL config (HTTP-internal vs HTTPS-internal), HA's OAuth `/auth/token` flow, cloudflared add-on version, cloudflared protocol (QUIC vs HTTP/2), tunnel mode (cert-based vs token-based managed), WAF custom rules, Cloudflare Access policies, Page Rules, Configuration Rules, WS compression (`permessage-deflate`), CF Workers proxying. The only thing that mattered was the per-hostname mTLS flag interacting with HTTP/3 zone-wide.
->
-> ### About `cloudflare_recovery.js` in this repo
->
-> This repo was originally created for a **different** Cloudflare problem: `CF_Authorization` cookie expiry causing the same user-visible symptom ("Unable to connect", reload doesn't help, mobile works). **We don't know whether that original problem still exists in current Cloudflare/HA versions** — it hasn't been re-tested since this mTLS+HTTP/3 discovery. The script and the detailed guide below are kept for reference. If you have the mTLS+HTTP/3 bug above, the script can detect a "stripped upgrade" signature in some cases but **cannot fix it from the browser** — the fix is the split-hostname approach above.
->
-> ---
+This repo started as a fix for one specific HA-behind-Cloudflare bug: the `CF_Authorization` cookie expiring and stranding the browser frontend on a stale Service Worker shell. The fix is a small drop-in script (`cloudflare_recovery.js`) — that story starts at [Failure mode 2 — `CF_Authorization` cookie expiry](#failure-mode-2--cf_authorization-cookie-expiry).
+
+Two **other** Cloudflare-Tunnel-in-front-of-HA failure modes produce the **same user-visible symptom** ("Unable to connect to Home Assistant", reloads don't help, mobile Companion app still works) but have different root causes and different fixes. They're documented here too because the time wasted chasing the wrong fix is significant.
+
+---
+
+## Which failure mode are you hitting?
+
+| # | Symptom hints | Root cause | Fix |
+|---|---|---|---|
+| **1** | Fails on **fresh Chromium incognito** (Chrome/Edge/Brave); existing tabs OK; Firefox OK; HA core log shows `Received close message during auth phase` immediately after `Connected from <ip>` | **Cloudflare bug: mTLS + HTTP/3 + WebSocket = broken on Chromium browsers** | [Failure mode 1](#failure-mode-1--cloudflare-mtls--http3--websocket-broken-on-chromium) |
+| **2** | Frontend freezes after **hours or days**; mobile Companion app keeps working; manual workaround is to open HA in **incognito**, copy CF's login URL into the stuck tab | **`CF_Authorization` cookie expired**, browser can't see the auth redirect (CORS + WebSockets + Service Worker conspire to hide it) | [Failure mode 2](#failure-mode-2--cf_authorization-cookie-expiry) — drop in `cloudflare_recovery.js` |
+| **3** | Every `/api/websocket` request returns **HTTP 400** with body `No WebSocket UPGRADE hdr`; reloads sometimes briefly work, then break again | **cloudflared's default `--protocol=auto` (QUIC) strips the WS Upgrade header** between CF edge and HA origin | [Failure mode 3](#second-failure-mode-websocket-upgrade-stripping) — one-line cloudflared config |
+
+`cloudflare_recovery.js` only fixes mode 2. It can *detect* and log a loud diagnostic for mode 3, but the actual fix is in cloudflared. It can't see mode 1 at all (the page never finishes loading because the WebSocket dies during the auth handshake) — the fix lives at the Cloudflare config layer.
+
+---
+
+## Failure mode 1 — Cloudflare mTLS + HTTP/3 + WebSocket broken on Chromium
+
+*Documented 2026-06-05 after a long debugging session on a setup with exactly this symptom.*
+
+If **all of the following are true**, this is your bug:
+
+1. You expose HA via Cloudflare Tunnel (with or without Cloudflare Access — even with Access fully disabled).
+2. The hostname has **mTLS enabled** at Cloudflare (SSL/TLS → Client Certificates → "Hosts" includes your HA hostname — commonly configured so the HA Companion mobile app can present a client cert).
+3. **HTTP/3 is enabled at the zone level** (it is, by default).
+4. You're using a **Chromium-family browser** (Chrome, Edge, Brave, Arc, Opera) — fresh incognito reproduces cleanly.
+
+**Firefox is unaffected** because Firefox doesn't implement WebSocket-over-HTTP/3 (RFC 8441 Extended CONNECT); it falls back to HTTP/1.1 for the WS upgrade. **Existing tabs** with a warm HTTP/2 connection to the tunnel are also unaffected — the bug only manifests on cold connections that negotiate HTTP/3 from the start.
+
+### What's happening at the protocol level
+
+mTLS makes the Cloudflare edge send a TLS 1.3 `CertificateRequest` (handshake message 13). Browsers without a client cert reply with an empty `Certificate` message — standard mTLS-optional behavior. This works perfectly over HTTP/1.1 and HTTP/2. Over HTTP/3 (QUIC), the combination of `CertificateRequest` + the WebSocket `Upgrade` (RFC 8441) breaks somewhere in Cloudflare's edge: HA's first WS server frame (`auth_required`) never reaches the browser correctly, and the browser closes the connection within ~300 ms during the auth phase. HA's logs show:
+
+```
+Connected from <ip>
+Connection closed by client: Received close message during auth phase
+```
+
+### How to recognise it
+
+From any terminal with `curl`:
+
+```bash
+# If this prints a "Request CERT" line, your hostname has mTLS enforced at CF:
+echo | curl -sSv --max-time 5 -o /dev/null https://YOUR-HA-HOSTNAME/ 2>&1 | grep "Request CERT"
+```
+
+Combine that with: HTTP/3 ON at the zone (`dash.cloudflare.com → your zone → Network → HTTP/3 (with QUIC)`) and fresh Chrome incognito unable to complete the HA login WebSocket → this is your bug.
+
+### Fix option A — Split hostnames (recommended; what we did)
+
+Cloudflare provides no way to disable HTTP/3 per-hostname on the free tier (we tried — Transform Rules stripping `Alt-Svc` don't help because CF also auto-publishes HTTPS DNS records (RFC 9460) advertising HTTP/3, which browsers read at DNS-resolution time before any HTTP response).
+
+The clean workaround is to use **two hostnames** pointing at the same tunnel:
+
+| Hostname | mTLS | Purpose |
+|---|---|---|
+| `mobile-ha.example.com` | **ON** | HA Companion mobile app only |
+| `ha.example.com` | **OFF** | Web browser access |
+
+Setup:
+
+1. **Identify your existing mTLS hostname** — Cloudflare dashboard → SSL/TLS → Client Certificates → "Hosts". Don't change this; the mobile app continues using it.
+2. **Add a second public hostname** to your cloudflared tunnel (Zero Trust → Networks → Tunnels → your tunnel → Configure → Public Hostnames → add, e.g. `ha.example.com` → `http://homeassistant:8123`). This second hostname is **not** added to the mTLS hosts list, so its TLS handshake contains no `CertificateRequest`.
+3. **Verify the new hostname has no mTLS:**
+   ```bash
+   echo | curl -sSv --max-time 5 -o /dev/null https://ha.example.com/ 2>&1 | grep "Request CERT" || echo "no mTLS — good"
+   ```
+4. **Bookmark the new hostname** for browser use. Optionally set it as HA's External URL (Settings → System → General → External URL) so notifications, Google Assistant callbacks, etc. use it.
+5. **HA Companion mobile app stays on the mTLS hostname** — no change needed in the mobile-app config.
+
+HTTP/3 stays on zone-wide. Other subdomains keep HTTP/3. No performance regression anywhere.
+
+### Fix option B — Cloudflare for SaaS custom hostnames (untested backup)
+
+We didn't need this — Option A was sufficient — but it's the right escape hatch for the case where Option A stops being viable (e.g. mTLS is no longer used as the convenient "this hostname needs HTTP/2" gate, or you need a third hostname with a different HTTP/3 stance). It's the only known way to **disable HTTP/3 for a single hostname while keeping it on for everything else in the same zone** on the free Cloudflare tier.
+
+The idea: **Cloudflare for SaaS** (Custom Hostnames) — free for the first 100 custom hostnames — lets you route a hostname through a *different* CF zone's settings, including that zone's HTTP/3 setting.
+
+**Prerequisites:** a spare root domain on Cloudflare Free (a `.lol` / `.xyz` for ~$1-2/yr works — it doesn't need to host anything else).
+
+**Setup:**
+
+1. Add the **spare domain** to CF Free. Speed → Optimization → Protocol Optimization → HTTP/3 (with QUIC) → **OFF**.
+2. Spare domain DNS: add an `A` record `fallback.spare-domain.example` → origin server IP (any IP — it's a placeholder for SaaS fallback), **proxied (orange cloud)**.
+3. Spare domain SSL/TLS → Custom Hostnames → set **Fallback Origin** to `fallback.spare-domain.example`. (CF may ask for a payment method to activate SaaS; the first 100 custom hostnames are still free.)
+4. Spare domain SSL/TLS → Custom Hostnames → **Add Custom Hostname**: enter your real hostname (`ha.example.com`). CF gives you a TXT record for ownership validation + a CNAME target.
+5. **Main domain DNS** (the zone your hostname normally lives in): add the TXT records, then **change the `ha` CNAME** to point to `fallback.spare-domain.example`, set to **DNS Only (grey cloud)**.
+
+**Why it works:** the grey-cloud CNAME on the main domain resolves to CF's edge via the spare domain's anycast IPs. Cloudflare matches the SNI to the spare domain's custom-hostname mapping, applies *spare-domain* settings — including HTTP/3 OFF — and proxies through. The main domain stays on HTTP/3 zone-wide for everything else.
+
+**Caveats:**
+
+- For **tunnel-served** hostnames (`cfargotunnel.com` target), the fallback-origin model is more complex because the tunnel CNAME wants to be proxied in its *own* zone. Workable, but needs more design thought than the split-hostname approach.
+- You now depend on the spare domain's renewal — if it lapses, the SaaS mapping disappears.
+- Adds an account-level dependency on the spare domain remaining in your CF account.
+
+### What we ruled out before finding mTLS as the trigger
+
+All of these were tested and innocent: HA SSL config (HTTP-internal vs HTTPS-internal), HA's OAuth `/auth/token` flow, cloudflared add-on version, cloudflared protocol (QUIC vs HTTP/2), tunnel mode (cert-based vs token-based managed), WAF custom rules, Cloudflare Access policies, Page Rules, Configuration Rules, WS compression (`permessage-deflate`), CF Workers proxying. The only thing that mattered was the per-hostname mTLS flag interacting with HTTP/3 zone-wide.
+
+### Why `cloudflare_recovery.js` can't fix this one
+
+The script in this repo was written for the `CF_Authorization` cookie-expiry case (Failure mode 2 below). It can't fix Failure mode 1 — the page never reaches a state where the script can recover from anything, because the WebSocket dies during the auth handshake before HA finishes loading. Use Option A or Option B above instead.
+
+---
+
+## Failure mode 2 — `CF_Authorization` cookie expiry
 
 **A drop-in JavaScript module that lets the Home Assistant web frontend — in any browser, on desktop or mobile — gracefully recover when the Cloudflare Access `CF_Authorization` cookie expires.**
 
